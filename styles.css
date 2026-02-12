@@ -27,7 +27,7 @@
 
 @font-face {
     font-family: 'Montserrat-Bold';
-    src: url('fonts/Montserrat-Bodld.woff2') format('woff2'),
+    src: url('fonts/Montserrat-Bold.woff2') format('woff2'),
          url('fonts/Montserrat-Bold.woff') format('woff');
     font-weight: 700;
     font-style: normal;
@@ -796,10 +796,10 @@ body {
 
 .modal-title {
     font-family: "Montserrat-Bold", sans-serif;
-    font-size: 16px;
+    font-size: 18px;
+    line-height: 120%;
     text-align: center;
     margin-bottom: 24px;
-    line-height: 1.4;
     color: #1a1a1a;
     text-transform: uppercase;
 }
@@ -813,9 +813,9 @@ body {
 
 .modal-input {
     width: 100%;
-    padding: 14px 16px;
+    padding: 0 10px 0 24px;
     border: 1px solid #ddd;
-    border-radius: 6px;
+    border-radius: 50%;
     font-size: 14px;
     font-family: "Montserrat-Regular", sans-serif;
     outline: none;

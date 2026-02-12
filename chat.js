@@ -13,7 +13,7 @@ const sendBtn = document.getElementById('sendBtn');
 const chatWindow = document.querySelector('.chat-window');
 
 // Рингтон для сообщений
-const ringtone = new Audio('ringtone.mp3');
+const ringtone = new Audio('sound/ringtone.mp3');
 
 function playRingtone() {
     // Останавливаем предыдущее воспроизведение чтобы не было наложений
