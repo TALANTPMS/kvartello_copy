@@ -1,5 +1,5 @@
 const express = require('express');
-const path = require('path');
+const sendContactRouter = require('./unisender-go-mailer');
 
 // Локально читаем .env.local, на Railway переменные задаются в дашборде
 try { require('dotenv').config({ path: '.env.local' }); } catch (e) {}
@@ -9,6 +9,9 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware для парсинга JSON
 app.use(express.json());
+
+// API route для отправки заявок (UniSender + Bitrix)
+app.use(sendContactRouter);
 
 // Отдача статических файлов
 app.use(express.static(__dirname));

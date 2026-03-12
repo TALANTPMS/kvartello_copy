@@ -11,9 +11,16 @@ const chatInput = document.getElementById('chatInput');
 const chatMessages = document.getElementById('chatMessages');
 const sendBtn = document.getElementById('sendBtn');
 const chatWindow = document.querySelector('.chat-window');
+let remodalApi = null;
+let thanksRedirectTimer = null;
+let chatWindowMinHeight = 0;
+let chatWindowBaseMinHeight = 400;
+let pageScrollAnimationFrameId = null;
+let pageScrollTargetY = 0;
 
 // Рингтон для сообщений
 const ringtone = new Audio('sounds/ringtone.mp3');
+const THANKS_NAME_STORAGE_KEY = 'thanks_client_name';
 
 function playRingtone() {
     // Останавливаем предыдущее воспроизведение чтобы не было наложений
@@ -25,6 +32,98 @@ function playRingtone() {
 // История сообщений для контекста
 let messageHistory = [];
 let systemPrompt = '';
+let dialogTranscript = [];
+let chatLeadSent = false;
+
+function recordTranscriptEntry(role, content) {
+    const text = String(content || '').trim();
+    if (!text) return;
+    dialogTranscript.push({
+        role,
+        content: text,
+        timestamp: new Date().toISOString()
+    });
+}
+
+function decodeChatMarkersToRu(content) {
+    let text = String(content || '');
+    if (!text) return '';
+
+    const markerMap = {
+        START_QUESTIONS: '[Стартовые вопросы]',
+        ASK_MESSENGER: '[Выбор мессенджера]',
+        NAME_INPUT: '[Запрос имени]',
+        PHONE_INPUT: '[Запрос телефона]',
+        REQUEST_ACCEPTED: '[Заявка принята]',
+        SHOW_GALLERY: '[Показ галереи]'
+    };
+
+    text = text.replace(/\[BUTTON:\s*([^\]]+)\]/g, (_, optionsText) => {
+        const options = String(optionsText || '')
+            .split('|')
+            .map((item) => item.trim())
+            .filter(Boolean);
+        if (!options.length) return '[Кнопки выбора]';
+        return `[Кнопки выбора: ${options.join(', ')}]`;
+    });
+
+    text = text.replace(/\[\s*([A-Z_]+)\s*\]/g, (fullMatch, markerName) => {
+        if (markerName === 'MESSAGE_DIVIDER') {
+            return '';
+        }
+        return markerMap[markerName] || fullMatch;
+    });
+
+    return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function buildChatTranscriptText() {
+    if (!dialogTranscript.length) return '';
+    return dialogTranscript
+        .map((entry) => {
+            const roleLabel = entry.role === 'assistant' ? 'Менеджер' : 'Клиент';
+            const preparedContent = decodeChatMarkersToRu(entry.content);
+            if (!preparedContent) return '';
+            return `${roleLabel}: ${preparedContent}`;
+        })
+        .filter(Boolean)
+        .join('\n');
+}
+
+async function sendChatLeadIfReady() {
+    if (chatLeadSent) return;
+    const name = String(window.userName || '').trim();
+    const phone = String(window.userPhone || '').trim();
+    if (!name || !phone) return;
+
+    chatLeadSent = true;
+
+    const payload = {
+        name,
+        phone,
+        messenger: String(window.userMessenger || '').trim(),
+        page_url: window.location.href,
+        section_name: 'Заявка из чата',
+        section_name_text: 'Чат-бот',
+        section_btn_text: 'Отправить',
+        chat_history: buildChatTranscriptText()
+    };
+
+    try {
+        const response = await fetch('/api/send_contact', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || 'Не удалось отправить заявку из чата.');
+        }
+    } catch (error) {
+        console.error('Ошибка отправки заявки из чата:', error);
+        chatLeadSent = false;
+    }
+}
 
 // Загрузка системного промпта
 async function loadSystemPrompt() {
@@ -93,26 +192,36 @@ async function initializeDialog() {
     } finally {
         sendBtn.disabled = false;
         chatInput.disabled = false;
-        chatInput.focus();
     }
 }
 
 // Инициализация
 document.addEventListener('DOMContentLoaded', async () => {
-    chatForm.addEventListener('submit', handleSubmit);
-    
-    // Cookie Banner
+    // Все модальные окна и форма обратного звонка доступны на разных страницах
+    remodalApi = initRemodals();
+    initCallbackRequestForm();
     initCookieBanner();
+    applyThanksClientName();
 
-    // Модалка "Заказать звонок"
-    initCallModal();
-    
+    const hasChatUI = chatForm && chatInput && chatMessages && sendBtn && chatWindow;
+    if (!hasChatUI) return;
+    initializeChatSizingState();
+
+    chatForm.addEventListener('submit', handleSubmit);
+
     // Загружаем системный промпт
     await loadSystemPrompt();
-    
+
     // Инициализируем диалог
     await initializeDialog();
 });
+
+function initializeChatSizingState() {
+    if (!chatWindow) return;
+    const parsedMin = parseFloat(getComputedStyle(chatWindow).minHeight);
+    chatWindowBaseMinHeight = Number.isFinite(parsedMin) ? parsedMin : 400;
+    chatWindowMinHeight = chatWindowBaseMinHeight;
+}
 
 // Cookie Banner
 function initCookieBanner() {
@@ -130,59 +239,244 @@ function initCookieBanner() {
     });
 }
 
-// Модалка "Заказать звонок"
-function initCallModal() {
-    const modal = document.getElementById('callModal');
-    const closeBtn = document.getElementById('modalClose');
-    const openBtns = document.querySelectorAll('[data-remodal-target="modal-form-call"]');
-    const form = document.getElementById('callForm');
+// Единая логика модалок с data-remodal-id/data-remodal-target
+function initRemodals() {
+    const remodals = Array.from(document.querySelectorAll('.remodal[data-remodal-id]'));
+    if (!remodals.length) return;
 
-    if (!modal) return;
-
-    // Открытие модалки
-    openBtns.forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            e.preventDefault();
-            modal.classList.add('active');
-            document.body.style.overflow = 'hidden';
-        });
+    remodals.forEach((modal) => {
+        modal.classList.remove('remodal-is-opened');
+        modal.setAttribute('aria-hidden', 'true');
     });
 
-    // Закрытие по крестику
-    if (closeBtn) {
-        closeBtn.addEventListener('click', () => {
-            modal.classList.remove('active');
-            document.body.style.overflow = '';
+    const overlay = document.createElement('div');
+    overlay.className = 'remodal-overlay';
+    document.body.appendChild(overlay);
+
+    let activeModal = null;
+
+    function closeActiveModal() {
+        if (!activeModal) return;
+        activeModal.classList.remove('remodal-is-opened');
+        activeModal.setAttribute('aria-hidden', 'true');
+        overlay.classList.remove('remodal-is-opened');
+        document.body.classList.remove('remodal-is-opened');
+        activeModal = null;
+    }
+
+    function openModal(targetId) {
+        const modal = remodals.find((item) => item.dataset.remodalId === targetId);
+        if (!modal) return;
+        closeActiveModal();
+        activeModal = modal;
+        activeModal.classList.add('remodal-is-opened');
+        activeModal.setAttribute('aria-hidden', 'false');
+        overlay.classList.add('remodal-is-opened');
+        document.body.classList.add('remodal-is-opened');
+    }
+
+    document.addEventListener('click', (event) => {
+        const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+        if (!target) return;
+
+        const openTrigger = target.closest('[data-remodal-target]');
+        if (openTrigger) {
+            const targetId = openTrigger.dataset.remodalTarget;
+            if (remodals.some((modal) => modal.dataset.remodalId === targetId)) {
+                event.preventDefault();
+                openModal(targetId);
+                return;
+            }
+        }
+
+        const scrollTopTrigger = target.closest('[data-scroll-top]');
+        if (scrollTopTrigger) {
+            const modalForScroll = (activeModal && activeModal.contains(scrollTopTrigger))
+                ? activeModal
+                : scrollTopTrigger.closest('.remodal[data-remodal-id]');
+            if (modalForScroll) {
+                event.preventDefault();
+                modalForScroll.scrollTo({ top: 0, behavior: 'smooth' });
+                return;
+            }
+        }
+
+        const closeTrigger = target.closest('[data-remodal-action="close"]');
+        if (closeTrigger && activeModal && activeModal.contains(closeTrigger)) {
+            event.preventDefault();
+            closeActiveModal();
+        }
+    });
+
+    overlay.addEventListener('click', closeActiveModal);
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeActiveModal();
+        }
+    });
+
+    return {
+        open: openModal,
+        close: closeActiveModal
+    };
+}
+
+function initCallbackRequestForm() {
+    const form = document.getElementById('callbackRequestForm');
+    if (!form) return;
+
+    const errorNode = document.getElementById('callbackFormError');
+    const submitBtn = form.querySelector('.call-modal__submit');
+    const openTriggers = document.querySelectorAll('[data-remodal-target="modal-form-call"]');
+    const phoneInput = form.querySelector('input[name="phone"]');
+    const agreeInput = form.querySelector('input[name="agree"]');
+
+    const setError = (message) => {
+        if (errorNode) errorNode.textContent = message || '';
+    };
+
+    const resetMessages = () => {
+        setError('');
+    };
+
+    if (phoneInput) {
+        phoneInput.addEventListener('input', () => {
+            phoneInput.value = formatKzPhone(phoneInput.value);
+        });
+        phoneInput.addEventListener('focus', () => {
+            if (!phoneInput.value.trim()) {
+                phoneInput.value = '+7 ';
+            }
         });
     }
 
-    // Закрытие по клику на оверлей
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) {
-            modal.classList.remove('active');
-            document.body.style.overflow = '';
-        }
-    });
+    if (agreeInput) {
+        agreeInput.addEventListener('change', () => {
+            if (agreeInput.checked) {
+                setError('');
+            }
+        });
+    }
 
-    // Закрытие по Escape
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            modal.classList.remove('active');
-            document.body.style.overflow = '';
-        }
-    });
-
-    // Обработка формы
-    if (form) {
-        form.addEventListener('submit', (e) => {
-            e.preventDefault();
-            // Здесь можно добавить отправку данных на сервер
-            alert('Спасибо! Мы свяжемся с вами в ближайшее время.');
-            modal.classList.remove('active');
-            document.body.style.overflow = '';
+    openTriggers.forEach((trigger) => {
+        trigger.addEventListener('click', () => {
+            resetMessages();
             form.reset();
         });
+    });
+
+    form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        resetMessages();
+        let shouldUnlockSubmit = true;
+
+        const formData = new FormData(form);
+        const name = String(formData.get('name') || '').trim();
+        const phone = String(formData.get('phone') || '').trim();
+        const agreed = formData.get('agree') === 'on';
+
+        if (!form.checkValidity()) {
+            form.reportValidity();
+            return;
+        }
+
+        if (!agreed) {
+            setError('Необходимо согласиться с условиями обработки персональных данных.');
+            return;
+        }
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Отправляем...';
+        }
+
+        try {
+            const payload = {
+                name,
+                phone,
+                messenger: '',
+                page_url: window.location.href,
+                section_name: 'Форма обратного звонка',
+                section_name_text: 'Закажите обратный звонок',
+                section_btn_text: 'Заказать'
+            };
+
+            const response = await fetch('/api/send_contact', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.success) {
+                throw new Error(result.error || 'Не удалось отправить заявку. Попробуйте позже.');
+            }
+
+            shouldUnlockSubmit = false;
+            if (submitBtn) {
+                submitBtn.textContent = 'Заявка отправлена';
+            }
+            redirectToThanksPageAfterDelay(4000, name);
+        } catch (error) {
+            console.error('Ошибка отправки формы:', error);
+        } finally {
+            if (submitBtn && shouldUnlockSubmit) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Заказать';
+            }
+        }
+    });
+}
+
+function redirectToThanksPageAfterDelay(delayMs = 4000, clientName = '') {
+    if (thanksRedirectTimer) {
+        clearTimeout(thanksRedirectTimer);
     }
+    thanksRedirectTimer = setTimeout(() => {
+        const normalizedName = String(clientName || '').trim();
+        if (normalizedName) {
+            sessionStorage.setItem(THANKS_NAME_STORAGE_KEY, normalizedName);
+        }
+        window.location.href = 'thanks.html';
+    }, delayMs);
+}
+
+function applyThanksClientName() {
+    const nameNode = document.getElementById('thanksClientName');
+    if (!nameNode) return;
+
+    const savedName = String(sessionStorage.getItem(THANKS_NAME_STORAGE_KEY) || '').trim();
+    if (!savedName) {
+        nameNode.textContent = 'УВАЖАЕМЫЙ КЛИЕНТ,';
+        return;
+    }
+
+    nameNode.textContent = `${savedName.toUpperCase()},`;
+}
+
+function formatKzPhone(value) {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (!digits) return '';
+
+    let normalized = digits;
+    if (normalized.startsWith('8')) normalized = `7${normalized.slice(1)}`;
+    if (!normalized.startsWith('7')) normalized = `7${normalized}`;
+    normalized = normalized.slice(0, 11);
+
+    const cc = normalized.slice(0, 1);
+    const p1 = normalized.slice(1, 4);
+    const p2 = normalized.slice(4, 7);
+    const p3 = normalized.slice(7, 9);
+    const p4 = normalized.slice(9, 11);
+
+    let formatted = `+${cc}`;
+    if (p1) formatted += ` (${p1}`;
+    if (p1.length === 3) formatted += ')';
+    if (p2) formatted += ` ${p2}`;
+    if (p3) formatted += ` ${p3}`;
+    if (p4) formatted += ` ${p4}`;
+    return formatted;
 }
 
 // Обработка отправки формы
@@ -231,7 +525,6 @@ async function handleSubmit(e) {
         // Разблокируем кнопку отправки
         sendBtn.disabled = false;
         chatInput.disabled = false;
-        chatInput.focus();
     }
 }
 
@@ -291,7 +584,6 @@ async function sendAndProcessBotResponse() {
     } finally {
         sendBtn.disabled = false;
         chatInput.disabled = false;
-        chatInput.focus();
     }
 }
 
@@ -299,6 +591,7 @@ async function sendAndProcessBotResponse() {
 function addUserMessage(text) {
     const messageDiv = createMessageElement('user', text);
     chatMessages.appendChild(messageDiv);
+    recordTranscriptEntry('user', text);
     adjustChatWindowHeight();
     scrollToBottom();
 }
@@ -315,11 +608,11 @@ function getTypingDelay(text) {
 const DELAY = {
     TEXT: (text) => getTypingDelay(text),   // текстовый пузырёк
     BUTTONS: 1500,                           // кнопки выбора
-    MESSENGER: 900,                         // выбор мессенджера
-    INPUT_FORM: 800,                        // формы ввода
+    MESSENGER: 1000,                         // выбор мессенджера
+    INPUT_FORM: 1200,                        // формы ввода
     GALLERY: 1000,                          // галерея
-    START_QUESTIONS: 1000,                  // стартовые вопросы
-    ACCEPTED: 800,                          // плашка заявки
+    START_QUESTIONS: 1700,                  // стартовые вопросы
+    ACCEPTED: 1000,                          // плашка заявки
 };
 
 function sleep(ms) {
@@ -372,9 +665,8 @@ async function addBotMessage(text, existingLoader) {
     for (let i = 0; i < queue.length; i++) {
         const item = queue[i];
         
-        // Ждём задержку, затем убираем индикатор
+        // Ждём задержку, затем заменяем/убираем индикатор
         await sleep(item.delay);
-        removeLoadingMessage(loader);
         
         // Звук при появлении сообщения
         playRingtone();
@@ -382,9 +674,17 @@ async function addBotMessage(text, existingLoader) {
         // Выводим элемент
         if (item.type === 'text') {
             const messageDiv = createMessageElement('bot', item.content);
-            chatMessages.appendChild(messageDiv);
+            if (loader && loader.parentNode) {
+                loader.replaceWith(messageDiv);
+            } else {
+                chatMessages.appendChild(messageDiv);
+            }
         } else {
+            removeLoadingMessage(loader);
             handleMarker(item.marker);
+        }
+        if (item.type === 'text') {
+            recordTranscriptEntry('assistant', item.content);
         }
         
         adjustChatWindowHeight();
@@ -497,6 +797,7 @@ function showStartQuestions() {
         'Какие гарантии вы даете?',
         'Сколько времени требуется на создание франшизы?',
         'Как строится работа?',
+        'Возможен ли возврат средств, если что-то пойдет не так?',
         'Хочу задать свой вопрос'
     ];
     
@@ -579,6 +880,7 @@ function showMessengerOptions() {
             // Добавляем выбранный мессенджер как сообщение пользователя
             addUserMessage(messenger);
             messageHistory.push({ role: 'user', content: messenger });
+            window.userMessenger = messenger;
             
             // Удаляем контейнер с кнопками
             messengersContainer.remove();
@@ -640,6 +942,7 @@ function showNameInputForm() {
 
 // Продолжение после ввода имени
 async function continueAfterNameInput() {
+    await sendChatLeadIfReady();
     await sendAndProcessBotResponse();
 }
 
@@ -652,6 +955,16 @@ function showPhoneInputForm() {
     input.type = 'tel';
     input.className = 'phone-input';
     input.placeholder = 'Ваш телефон';
+    input.autocomplete = 'tel';
+
+    input.addEventListener('input', () => {
+        input.value = formatKzPhone(input.value);
+    });
+    input.addEventListener('focus', () => {
+        if (!input.value.trim()) {
+            input.value = '+7 ';
+        }
+    });
     
     const submitBtn = document.createElement('button');
     submitBtn.type = 'button';
@@ -680,6 +993,7 @@ function showPhoneInputForm() {
 
 // Продолжение после ввода телефона
 async function continueAfterPhoneInput() {
+    await sendChatLeadIfReady();
     await sendAndProcessBotResponse();
 }
 
@@ -696,6 +1010,7 @@ function showRequestAccepted() {
     chatMessages.appendChild(acceptedDiv);
     adjustChatWindowHeight();
     scrollToBottom();
+    redirectToThanksPageAfterDelay(4000, window.userName);
 }
 
 // Показать галерею примеров работ
@@ -789,7 +1104,6 @@ function addLoadingMessage() {
     loadingDiv.appendChild(loadingContent);
     chatMessages.appendChild(loadingDiv);
     
-    adjustChatWindowHeight();
     scrollToBottom();
     
     return loadingDiv;
@@ -812,32 +1126,67 @@ function getCurrentTime() {
 
 // Прокрутка вниз
 function scrollToBottom() {
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    scrollPageToChatBottom();
+}
+
+function scrollPageToChatBottom() {
+    if (!chatWindow) return;
+
+    const chatBottomY = chatWindow.getBoundingClientRect().bottom + window.scrollY;
+    const desiredY = Math.max(0, chatBottomY - window.innerHeight + 16);
+    pageScrollTargetY = desiredY;
+
+    if (pageScrollAnimationFrameId) return;
+
+    const step = () => {
+        const current = window.scrollY;
+        const distance = pageScrollTargetY - current;
+
+        if (Math.abs(distance) < 0.8) {
+            window.scrollTo(0, pageScrollTargetY);
+            pageScrollAnimationFrameId = null;
+            return;
+        }
+
+        const isLongScroll = Math.abs(distance) > 520;
+        const factor = isLongScroll ? 0.32 : 0.22;
+        const minStep = isLongScroll ? 2.5 : 1;
+        const rawDelta = distance * factor;
+        const delta = Math.sign(distance) * Math.max(minStep, Math.abs(rawDelta));
+        const next = current + delta;
+
+        window.scrollTo(0, distance > 0
+            ? Math.min(next, pageScrollTargetY)
+            : Math.max(next, pageScrollTargetY));
+
+        pageScrollAnimationFrameId = requestAnimationFrame(step);
+    };
+
+    pageScrollAnimationFrameId = requestAnimationFrame(step);
 }
 
 // Автоматическое увеличение высоты окна чата
 function adjustChatWindowHeight() {
-    const messagesHeight = chatMessages.scrollHeight;
-    const inputAreaHeight = document.querySelector('.chat-input-area').offsetHeight;
-    const avatarHeight = document.querySelector('.chat-avatar').offsetHeight;
-    
-    // Минимальная высота окна
-    const minHeight = 400;
-    
-    // Вычисляем необходимую высоту
-    const requiredHeight = messagesHeight + inputAreaHeight;
-    
-    // Если контент больше минимальной высоты, увеличиваем окно
-    if (requiredHeight > minHeight) {
-        chatWindow.style.height = 'auto';
-        chatWindow.style.minHeight = `${Math.max(requiredHeight, minHeight)}px`;
-    } else {
-        chatWindow.style.minHeight = `${minHeight}px`;
+    if (!chatWindow || !chatMessages) return;
+    const inputArea = document.querySelector('.chat-input-area');
+    if (!inputArea) return;
+
+    if (!chatWindowMinHeight) {
+        initializeChatSizingState();
     }
-    
-    // Прокручиваем вниз после изменения высоты
-    setTimeout(() => {
-        scrollToBottom();
-    }, 10);
+
+    const messagesHeight = chatMessages.scrollHeight;
+    const inputAreaHeight = inputArea.offsetHeight;
+    const requiredHeight = Math.ceil(messagesHeight + inputAreaHeight);
+    const targetHeight = Math.max(requiredHeight, chatWindowBaseMinHeight);
+
+    // Увеличиваем окно только вверх, чтобы не было "скачка" при замене лоадера на сообщение.
+    if (targetHeight > chatWindowMinHeight) {
+        chatWindowMinHeight = targetHeight;
+        chatWindow.style.height = 'auto';
+        chatWindow.style.minHeight = `${chatWindowMinHeight}px`;
+    }
+
+    scrollToBottom();
 }
 
